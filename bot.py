@@ -73,7 +73,7 @@ def text(name, side, kind, rsi_val, bar):
 
 def check(name, close, st):
     rsi, sma = analyze(close)
-         print(name, close.index[-1], round(rsi.iloc[-1], 2), round(sma.iloc[-1], 2), round(rsi.iloc[-2], 2), round(sma.iloc[-2], 2))
+    print(name, close.index[-1], round(rsi.iloc[-1], 2), round(sma.iloc[-1], 2), round(rsi.iloc[-2], 2), round(sma.iloc[-2], 2))
     now = datetime.now(timezone.utc)
     forming = close.index[-1] + pd.Timedelta(hours=4) > now
     msgs = []
