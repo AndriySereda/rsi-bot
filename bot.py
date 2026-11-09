@@ -14,13 +14,20 @@ STATE_FILE = "state.json"
 
 # --- настройки сигналов ---
 UPPER, LOWER = 70, 30      # зоны RSI
-TOUCH = 3               # насколько близко RSI должен подойти к SMA (пункты)
-ANGLE_MIN = 5             # минимальный угол отскока (градусы)
+TOUCH = 3                # насколько близко RSI должен подойти к SMA (пункты)
+ANGLE_MIN = 0              # минимальный угол отскока (градусы), 0 = без фильтра
 ANGLE_SCALE = 2.0          # на сколько пунктов RSI за свечу угол = 45 градусов
 ANGLE_FOR_CROSS = False    # True = фильтр угла и для пересечений
 
+# --- вершины и впадины RSI ---
+PIVOT_LEFT = 4             # с какими предыдущими свечами сравниваем
+PIVOT_RIGHT = 1            # сколько свечей после вершины нужно для подтверждения
+PIVOT_SWING = 5.0          # минимальный размах до вершины (пункты RSI)
+PIVOT_BACK = 1.0           # минимальный шаг назад после вершины (пункты RSI)
+NEAR_ZONE = 5              # насколько близко к 70 или 30 писать "у зоны"
+
 # --- дневная сводка ---
-SUMMARY_HOUR = 12          # час отправки по времени Штутгарта
+SUMMARY_HOUR = 8           # час отправки по времени Штутгарта
 
 
 def tg(text):
@@ -43,8 +50,14 @@ def get_crypto(sym):
     raise RuntimeError("Binance недоступен")
 
 
-def get_forex(sym):
-    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}=X",
+def fx_offset():
+    # 4H-свечи форекса в TradingView начинаются в 17:00 по Нью-Йорку
+    off = datetime.now(ZoneInfo("America/New_York")).utcoffset().total_seconds() / 3600
+    return f"{int((1 - off) % 4)}h"
+
+
+def get_yahoo(ticker, offset):
+    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
                      params={"interval": "1h", "range": "60d"},
                      headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
@@ -52,7 +65,7 @@ def get_forex(sym):
     idx = pd.to_datetime(res["timestamp"], unit="s", utc=True)
     s = pd.Series(res["indicators"]["quote"][0]["close"], index=idx,
                   dtype="float64").dropna()
-    return s.resample("4h").last().dropna()
+    return s.resample("4h", offset=offset).last().dropna()
 
 
 def analyze(close):
@@ -88,6 +101,26 @@ def bounce(r, m, i):
     if (-TOUCH <= d1 <= 0 and d0 < 0
             and r.iloc[i - 1] > r.iloc[i - 2] and r.iloc[i] < r.iloc[i - 1]):
         return "down"
+    return None
+
+
+def pivot(r, i):
+    # Вершина или впадина RSI, подтверждённая PIVOT_RIGHT свечами после неё.
+    # Возвращает (направление разворота, значение вершины, размах) или None.
+    last = i % len(r)
+    j = last - PIVOT_RIGHT
+    v = r.iloc[j - PIVOT_LEFT:last + 1].tolist()
+    left = v[:PIVOT_LEFT]
+    p = v[PIVOT_LEFT]
+    right = v[PIVOT_LEFT + 1:]
+    if p >= max(left) and p > max(right):
+        swing, back = p - min(left), p - right[-1]
+        if swing >= PIVOT_SWING and back >= PIVOT_BACK:
+            return "down", p, swing
+    if p <= min(left) and p < min(right):
+        swing, back = max(left) - p, right[-1] - p
+        if swing >= PIVOT_SWING and back >= PIVOT_BACK:
+            return "up", p, swing
     return None
 
 
@@ -132,6 +165,7 @@ def summary_line(name, close):
 
 def check(name, close, st):
     rsi, sma = analyze(close)
+    print(name, close.index[-1], round(rsi.iloc[-1], 2), round(sma.iloc[-1], 2))
     now = datetime.now(timezone.utc)
     forming = close.index[-1] + pd.Timedelta(hours=4) > now
     msgs = []
@@ -185,6 +219,24 @@ def check(name, close, st):
                              f"{icon} RSI отскочил от SMA {way} (угол {ang:.0f}°)",
                              rsi.iloc[ci], bar))
         st["bounce"] = key
+    # 5. Вершина или впадина RSI и разворот
+    pv = pivot(rsi, ci)
+    key = f"{bar}:{pv[0] if pv else None}"
+    if pv and st.get("pivot") != key:
+        d, val, swing = pv
+        way = "вниз" if d == "down" else "вверх"
+        icon = "🔻" if d == "down" else "🔺"
+        kind = "вершины" if d == "down" else "впадины"
+        near = ""
+        if val >= UPPER - NEAR_ZONE:
+            near = f", у зоны {UPPER}"
+        elif val <= LOWER + NEAR_ZONE:
+            near = f", у зоны {LOWER}"
+        msgs.append(note(name,
+                         f"{icon} RSI развернулся {way} от {kind} {val:.1f} "
+                         f"(ход {swing:.1f} п.{near})",
+                         rsi.iloc[ci], bar))
+        st["pivot"] = key
     return msgs
 
 
@@ -194,14 +246,17 @@ def main():
     if first:
         tg("✅ Бот запущен. Сигналы RSI/SMA будут приходить сюда.")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    jobs = [(s, get_forex, s) for s in FOREX] + [(s, get_crypto, s) for s in CRYPTO]
+    off = fx_offset()
+    jobs = ([(s, lambda s=s: get_yahoo(f"{s}=X", off)) for s in FOREX]
+            + [("XAUUSD", lambda: get_yahoo("GC=F", off))]
+            + [(s, lambda s=s: get_crypto(s)) for s in CRYPTO])
     rows = []
-    for name, fn, sym in jobs:
+    for name, fn in jobs:
         if name == CRYPTO[0]:
             rows.append("")
         st = state.setdefault(name, {})
         try:
-            close = fn(sym)
+            close = fn()
             for m in check(name, close, st):
                 tg(m)
             rows.append(summary_line(name, close))
