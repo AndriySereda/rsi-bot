@@ -14,7 +14,7 @@ STATE_FILE = "state.json"
 
 # --- настройки сигналов ---
 UPPER, LOWER = 70, 30      # зоны RSI
-TOUCH = 2                  # насколько близко RSI должен подойти к SMA (пункты)
+TOUCH = 1.5                # насколько близко RSI должен подойти к SMA (пункты)
 ANGLE_MIN = 0              # минимальный угол отскока (градусы), 0 = без фильтра
 ANGLE_SCALE = 2.0          # на сколько пунктов RSI за свечу угол = 45 градусов
 ANGLE_FOR_CROSS = False    # True = фильтр угла и для пересечений
@@ -25,18 +25,31 @@ PIVOT_RIGHT = 1            # сколько свечей после вершин
 PIVOT_SWING = 5.0          # минимальный размах до вершины (пункты RSI)
 PIVOT_BACK = 1.0           # минимальный шаг назад после вершины (пункты RSI)
 NEAR_ZONE = 5              # насколько близко к 70 или 30 писать "у зоны"
+PIVOT_PRELIMINARY = True   # True = сообщать о развороте сразу, не ждать закрытия свечи
 
 # --- отправка ---
 COMBINE_MESSAGES = False   # True = все новые сигналы одного запуска одним сообщением
 LATE_MINUTES = 25          # после скольких минут опоздания добавлять пометку
 
+# --- тихие часы по времени Штутгарта ---
+QUIET_START = (23, 30)     # с 23:30
+QUIET_END = (6, 0)         # до 6:00
+QUIET_MODE = "drop"        # "drop" = не отправлять, "silent" = отправлять без звука
+
 # --- дневная сводка ---
 SUMMARY_HOUR = 8           # час отправки по времени Штутгарта
 
 
-def tg(text):
+def tg(text, silent=False):
     requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  json={"chat_id": CHAT, "text": text}, timeout=20)
+                  json={"chat_id": CHAT, "text": text,
+                        "disable_notification": silent}, timeout=20)
+
+
+def is_quiet():
+    t = datetime.now(ZoneInfo("Europe/Berlin"))
+    now = (t.hour, t.minute)
+    return now >= QUIET_START or now < QUIET_END
 
 
 def get_crypto(sym):
@@ -129,7 +142,10 @@ def pivot(r, i):
 
 
 def stamp(bar):
-    return bar.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m %H:%M")
+    berlin = ZoneInfo("Europe/Berlin")
+    b = bar.astimezone(berlin)
+    e = (bar + pd.Timedelta(hours=4)).astimezone(berlin)
+    return f"{b.strftime('%d.%m %H:%M')}–{e.strftime('%H:%M')}"
 
 
 def late(bar):
@@ -140,16 +156,35 @@ def late(bar):
     return f"\n⏱ найден с опозданием {mins // 60} ч {mins % 60} мин"
 
 
+def msg(name, bar, line, rsi_val):
+    # формат: пара, время свечи, суть сигнала
+    return (f"{name} · 4H\n🕐 {stamp(bar)} (Штутгарт)\n{line}\n"
+            f"RSI {rsi_val:.1f}" + late(bar))
+
+
 def text(name, side, kind, rsi_val, bar):
     icon = "🟢" if side == "up" else "🔴"
     way = "ВВЕРХ" if side == "up" else "ВНИЗ"
-    return (f"{icon} {name} 4H: RSI пересёк SMA {way}\n{kind}\n"
-            f"RSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)" + late(bar))
+    return msg(name, bar, f"{icon} RSI пересёк SMA {way}\n{kind}", rsi_val)
 
 
 def note(name, title, rsi_val, bar):
-    return (f"{title}\n{name} 4H\n"
-            f"RSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)" + late(bar))
+    return msg(name, bar, title, rsi_val)
+
+
+def pivot_text(name, pv, rsi_now, bar, tag):
+    d, val, swing = pv
+    way = "вниз" if d == "down" else "вверх"
+    icon = "🔻" if d == "down" else "🔺"
+    kind = "вершины" if d == "down" else "впадины"
+    near = ""
+    if val >= UPPER - NEAR_ZONE:
+        near = f", у зоны {UPPER}"
+    elif val <= LOWER + NEAR_ZONE:
+        near = f", у зоны {LOWER}"
+    line = (f"{icon} RSI развернулся {way} от {kind} {val:.1f} "
+            f"(ход {swing:.1f} п.{near})\n{tag}")
+    return note(name, line, rsi_now, bar)
 
 
 def fmt_price(p):
@@ -184,9 +219,9 @@ def check(name, close, st):
     forming = close.index[-1] + pd.Timedelta(hours=4) > now
     msgs = []
 
-    # 1. Пересечение RSI и SMA, предварительное (свеча ещё идёт)
     if forming:
-        side = cross(rsi, sma, -1)
+        # 1. Пересечение RSI и SMA, предварительное (свеча ещё идёт)
+side = cross(rsi, sma, -1)
         if side and ANGLE_FOR_CROSS and angle(rsi, -1) < ANGLE_MIN:
             side = None
         key = f"{close.index[-1]}:{side}"
@@ -195,6 +230,16 @@ def check(name, close, st):
                          text(name, side, "⚠️ ПРЕДВАРИТЕЛЬНЫЙ (свеча ещё идёт)",
                               rsi.iloc[-1], close.index[-1])))
             st["pre"] = key
+
+        # 1б. Предварительный разворот RSI (без ожидания закрытия свечи)
+        if PIVOT_PRELIMINARY:
+            pv = pivot(rsi, -1)
+            key = f"{close.index[-1]}:{pv[0] if pv else None}"
+            if pv and st.get("pivot_pre") != key:
+                msgs.append((close.index[-1], 5,
+                             pivot_text(name, pv, rsi.iloc[-1], close.index[-1],
+                                        "⚠️ ПРЕДВАРИТЕЛЬНЫЙ (свеча ещё идёт)")))
+                st["pivot_pre"] = key
 
     ci = -2 if forming else -1
     bar = close.index[ci]
@@ -222,7 +267,8 @@ def check(name, close, st):
                  else f"🧊 RSI ниже {LOWER} (перепроданность)")
         msgs.append((bar, 1, note(name, title, rsi.iloc[ci], bar)))
         st["zone"] = key
-# 4. Отскок RSI от SMA, только если угол не меньше ANGLE_MIN
+
+    # 4. Отскок RSI от SMA, только если угол не меньше ANGLE_MIN
     b = bounce(rsi, sma, ci)
     key = f"{bar}:{b}"
     if b and st.get("bounce") != key:
@@ -236,24 +282,13 @@ def check(name, close, st):
                               rsi.iloc[ci], bar)))
         st["bounce"] = key
 
-    # 5. Вершина или впадина RSI и разворот
+    # 5. Вершина или впадина RSI, подтверждённая закрытой свечой
     pv = pivot(rsi, ci)
     key = f"{bar}:{pv[0] if pv else None}"
     if pv and st.get("pivot") != key:
-        d, val, swing = pv
-        way = "вниз" if d == "down" else "вверх"
-        icon = "🔻" if d == "down" else "🔺"
-        kind = "вершины" if d == "down" else "впадины"
-        near = ""
-        if val >= UPPER - NEAR_ZONE:
-            near = f", у зоны {UPPER}"
-        elif val <= LOWER + NEAR_ZONE:
-            near = f", у зоны {LOWER}"
         msgs.append((bar, 3,
-                     note(name,
-                          f"{icon} RSI развернулся {way} от {kind} {val:.1f} "
-                          f"(ход {swing:.1f} п.{near})",
-                          rsi.iloc[ci], bar)))
+                     pivot_text(name, pv, rsi.iloc[ci], bar,
+                                "✅ ПОДТВЕРЖДЁННЫЙ (свеча закрылась)")))
         st["pivot"] = key
     return msgs
 
@@ -264,6 +299,8 @@ def main():
     if first:
         tg("✅ Бот запущен. Сигналы RSI/SMA будут приходить сюда.")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    quiet = is_quiet()
+    can_send = (not quiet) or QUIET_MODE == "silent"
     off = fx_offset()
     jobs = ([(s, lambda s=s: get_yahoo(f"{s}=X", off)) for s in FOREX]
             + [("XAUUSD", lambda: get_yahoo("GC=F", off))]
@@ -280,19 +317,22 @@ def main():
             rows.append(summary_line(name, close))
         except Exception as e:
             rows.append(f"{name}  нет данных")
-            if st.get("err") != today:
-                tg(f"❗ Ошибка данных {name}: {str(e)[:150]}")
+            if st.get("err") != today and can_send:
+                tg(f"❗ Ошибка данных {name}: {str(e)[:150]}", silent=quiet)
                 st["err"] = today
 
     # Отправка: от старых сигналов к новым
     pending.sort(key=lambda x: (x[0], x[1]))
+    if quiet and QUIET_MODE != "silent":
+        print(f"Тихие часы: пропущено сообщений: {len(pending)}")
+        pending = []
     if COMBINE_MESSAGES and pending:
         body = "\n\n".join(m for _, _, m in pending)
         if len(body) < 3800:
-            tg(f"📬 Новые сигналы ({len(pending)}):\n\n" + body)
+            tg(f"📬 Новые сигналы ({len(pending)}):\n\n" + body, silent=quiet)
             pending = []
     for _, _, m in pending:
-        tg(m)
+        tg(m, silent=quiet)
         time.sleep(1.2)
 
     # Дневная сводка: один раз в день, в час SUMMARY_HOUR по Штутгарту
