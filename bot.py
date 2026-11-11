@@ -221,7 +221,7 @@ def check(name, close, st):
 
     if forming:
         # 1. Пересечение RSI и SMA, предварительное (свеча ещё идёт)
-side = cross(rsi, sma, -1)
+        side = cross(rsi, sma, -1)
         if side and ANGLE_FOR_CROSS and angle(rsi, -1) < ANGLE_MIN:
             side = None
         key = f"{close.index[-1]}:{side}"
