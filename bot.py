@@ -1,4 +1,4 @@
-import os, json, math
+import os, json, math, time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -14,7 +14,7 @@ STATE_FILE = "state.json"
 
 # --- настройки сигналов ---
 UPPER, LOWER = 70, 30      # зоны RSI
-TOUCH = 3                # насколько близко RSI должен подойти к SMA (пункты)
+TOUCH = 2                  # насколько близко RSI должен подойти к SMA (пункты)
 ANGLE_MIN = 0              # минимальный угол отскока (градусы), 0 = без фильтра
 ANGLE_SCALE = 2.0          # на сколько пунктов RSI за свечу угол = 45 градусов
 ANGLE_FOR_CROSS = False    # True = фильтр угла и для пересечений
@@ -25,6 +25,10 @@ PIVOT_RIGHT = 1            # сколько свечей после вершин
 PIVOT_SWING = 5.0          # минимальный размах до вершины (пункты RSI)
 PIVOT_BACK = 1.0           # минимальный шаг назад после вершины (пункты RSI)
 NEAR_ZONE = 5              # насколько близко к 70 или 30 писать "у зоны"
+
+# --- отправка ---
+COMBINE_MESSAGES = False   # True = все новые сигналы одного запуска одним сообщением
+LATE_MINUTES = 25          # после скольких минут опоздания добавлять пометку
 
 # --- дневная сводка ---
 SUMMARY_HOUR = 8           # час отправки по времени Штутгарта
@@ -128,15 +132,24 @@ def stamp(bar):
     return bar.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m %H:%M")
 
 
+def late(bar):
+    # пометка, если сигнал найден заметно позже закрытия свечи
+    mins = int((datetime.now(timezone.utc) - (bar + pd.Timedelta(hours=4))).total_seconds() / 60)
+    if mins < LATE_MINUTES:
+        return ""
+    return f"\n⏱ найден с опозданием {mins // 60} ч {mins % 60} мин"
+
+
 def text(name, side, kind, rsi_val, bar):
     icon = "🟢" if side == "up" else "🔴"
     way = "ВВЕРХ" if side == "up" else "ВНИЗ"
     return (f"{icon} {name} 4H: RSI пересёк SMA {way}\n{kind}\n"
-            f"RSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)")
+            f"RSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)" + late(bar))
 
 
 def note(name, title, rsi_val, bar):
-    return f"{title}\n{name} 4H\nRSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)"
+    return (f"{title}\n{name} 4H\n"
+            f"RSI {rsi_val:.1f} | свеча с {stamp(bar)} (Штутгарт)" + late(bar))
 
 
 def fmt_price(p):
@@ -164,6 +177,7 @@ def summary_line(name, close):
 
 
 def check(name, close, st):
+    # Возвращает список (время свечи, приоритет, текст) для сортировки по времени
     rsi, sma = analyze(close)
     print(name, close.index[-1], round(rsi.iloc[-1], 2), round(sma.iloc[-1], 2))
     now = datetime.now(timezone.utc)
@@ -177,8 +191,9 @@ def check(name, close, st):
             side = None
         key = f"{close.index[-1]}:{side}"
         if side and st.get("pre") != key:
-            msgs.append(text(name, side, "⚠️ ПРЕДВАРИТЕЛЬНЫЙ (свеча ещё идёт)",
-                             rsi.iloc[-1], close.index[-1]))
+            msgs.append((close.index[-1], 4,
+                         text(name, side, "⚠️ ПРЕДВАРИТЕЛЬНЫЙ (свеча ещё идёт)",
+                              rsi.iloc[-1], close.index[-1])))
             st["pre"] = key
 
     ci = -2 if forming else -1
@@ -190,8 +205,9 @@ def check(name, close, st):
         side = None
     key = f"{bar}:{side}"
     if side and st.get("conf") != key:
-        msgs.append(text(name, side, "✅ ПОДТВЕРЖДЁННЫЙ (свеча закрылась)",
-                         rsi.iloc[ci], bar))
+        msgs.append((bar, 0,
+                     text(name, side, "✅ ПОДТВЕРЖДЁННЫЙ (свеча закрылась)",
+                          rsi.iloc[ci], bar)))
         st["conf"] = key
 
     # 3. RSI вошёл в зону выше 70 или ниже 30
@@ -204,10 +220,9 @@ def check(name, close, st):
     if zone and st.get("zone") != key:
         title = (f"🔥 RSI выше {UPPER} (перекупленность)" if zone == "high"
                  else f"🧊 RSI ниже {LOWER} (перепроданность)")
-        msgs.append(note(name, title, rsi.iloc[ci], bar))
+        msgs.append((bar, 1, note(name, title, rsi.iloc[ci], bar)))
         st["zone"] = key
-
-    # 4. Отскок RSI от SMA, только если угол не меньше ANGLE_MIN
+# 4. Отскок RSI от SMA, только если угол не меньше ANGLE_MIN
     b = bounce(rsi, sma, ci)
     key = f"{bar}:{b}"
     if b and st.get("bounce") != key:
@@ -215,10 +230,12 @@ def check(name, close, st):
         if ang >= ANGLE_MIN:
             way = "вверх" if b == "up" else "вниз"
             icon = "↗️" if b == "up" else "↘️"
-            msgs.append(note(name,
-                             f"{icon} RSI отскочил от SMA {way} (угол {ang:.0f}°)",
-                             rsi.iloc[ci], bar))
+            msgs.append((bar, 2,
+                         note(name,
+                              f"{icon} RSI отскочил от SMA {way} (угол {ang:.0f}°)",
+                              rsi.iloc[ci], bar)))
         st["bounce"] = key
+
     # 5. Вершина или впадина RSI и разворот
     pv = pivot(rsi, ci)
     key = f"{bar}:{pv[0] if pv else None}"
@@ -232,10 +249,11 @@ def check(name, close, st):
             near = f", у зоны {UPPER}"
         elif val <= LOWER + NEAR_ZONE:
             near = f", у зоны {LOWER}"
-        msgs.append(note(name,
-                         f"{icon} RSI развернулся {way} от {kind} {val:.1f} "
-                         f"(ход {swing:.1f} п.{near})",
-                         rsi.iloc[ci], bar))
+        msgs.append((bar, 3,
+                     note(name,
+                          f"{icon} RSI развернулся {way} от {kind} {val:.1f} "
+                          f"(ход {swing:.1f} п.{near})",
+                          rsi.iloc[ci], bar)))
         st["pivot"] = key
     return msgs
 
@@ -251,20 +269,31 @@ def main():
             + [("XAUUSD", lambda: get_yahoo("GC=F", off))]
             + [(s, lambda s=s: get_crypto(s)) for s in CRYPTO])
     rows = []
+    pending = []
     for name, fn in jobs:
         if name == CRYPTO[0]:
             rows.append("")
         st = state.setdefault(name, {})
         try:
             close = fn()
-            for m in check(name, close, st):
-                tg(m)
+            pending.extend(check(name, close, st))
             rows.append(summary_line(name, close))
         except Exception as e:
             rows.append(f"{name}  нет данных")
             if st.get("err") != today:
                 tg(f"❗ Ошибка данных {name}: {str(e)[:150]}")
                 st["err"] = today
+
+    # Отправка: от старых сигналов к новым
+    pending.sort(key=lambda x: (x[0], x[1]))
+    if COMBINE_MESSAGES and pending:
+        body = "\n\n".join(m for _, _, m in pending)
+        if len(body) < 3800:
+            tg(f"📬 Новые сигналы ({len(pending)}):\n\n" + body)
+            pending = []
+    for _, _, m in pending:
+        tg(m)
+        time.sleep(1.2)
 
     # Дневная сводка: один раз в день, в час SUMMARY_HOUR по Штутгарту
     berlin = datetime.now(ZoneInfo("Europe/Berlin"))
