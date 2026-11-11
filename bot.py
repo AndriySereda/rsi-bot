@@ -8,8 +8,8 @@ TOKEN = os.environ["TG_TOKEN"]
 CHAT = os.environ["TG_CHAT"]
 RSI_LEN, SMA_LEN = 20, 14
 FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
-         "NZDUSD", "EURJPY", "GBPJPY", "EURGBP", "AUDJPY", "EURCHF"]
-CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+         "NZDUSD", "EURGBP"]
+CRYPTO = ["BTCUSD"]
 STATE_FILE = "state.json"
 
 # --- настройки сигналов ---
