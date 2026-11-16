@@ -29,8 +29,9 @@ LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 
 RSI_LEN, SMA_LEN = 20, 14
-FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
-CRYPTO = ["BTCUSDT"]
+FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
+         "NZDUSD", "EURJPY", "GBPJPY", "EURGBP", "AUDJPY", "EURCHF"]
+CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 # --- настройки сигналов ---
 UPPER, LOWER = 70, 30      # зоны RSI
